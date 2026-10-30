@@ -1,0 +1,131 @@
+name: Build OpenCloud IdP assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream opencloud version without the leading v (empty = latest upstream release)"
+        required: false
+        type: string
+      revision:
+        description: "Rebuild counter for the same upstream version (empty = first build)"
+        required: false
+        type: string
+  schedule:
+    # Weekly check for a new upstream release.
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-idp-assets
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: opencloud-eu/opencloud
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repository (scripts)
+        uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_REVISION: ${{ inputs.revision }}
+        run: |
+          set -eu
+          version="${IN_VERSION#v}"
+          if [ -z "$version" ]; then
+            version="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)"
+            version="${version#v}"
+          fi
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || { echo "::error::invalid version: $version"; exit 1; }
+          printf '%s' "$IN_REVISION" | grep -Eq '^[0-9]*$' \
+            || { echo "::error::invalid revision: $IN_REVISION"; exit 1; }
+
+          suffix=""
+          [ -n "$IN_REVISION" ] && suffix="-r${IN_REVISION}"
+          tag="v${version}${suffix}"
+          asset="opencloud-idp-assets-${version}${suffix}.tar.gz"
+
+          # Releases are immutable: never replace an already published asset,
+          # its checksum is recorded in the FreeBSD port's distinfo.
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::release $tag already exists, nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "asset=$asset"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream source
+        if: steps.v.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/v${{ steps.v.outputs.version }}
+          path: src
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: steps.v.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the pnpm version pinned by upstream
+        if: steps.v.outputs.skip != 'true'
+        run: |
+          set -eu
+          pm="$(jq -r .packageManager src/services/idp/package.json)"
+          case "$pm" in pnpm@*) ;; *) echo "::error::unexpected packageManager: $pm"; exit 1;; esac
+          npm install -g "$pm"
+          pnpm --version
+
+      - name: Build the assets
+        if: steps.v.outputs.skip != 'true'
+        env:
+          ASSET: ${{ steps.v.outputs.asset }}
+        run: |
+          set -eu
+          sh scripts/build.sh "$PWD/src" "$PWD/dist/$ASSET"
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          cat "dist/$ASSET.sha256"
+
+      - name: Publish release
+        if: steps.v.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          VERSION: ${{ steps.v.outputs.version }}
+          ASSET: ${{ steps.v.outputs.asset }}
+        run: |
+          set -eu
+          upstream_sha="$(git -C src rev-parse HEAD)"
+          pnpm_ver="$(pnpm --version)"
+          node_ver="$(node --version)"
+          sha="$(cut -d' ' -f1 "dist/$ASSET.sha256")"
+          cat > notes.md <<EOF
+          Prebuilt web assets of the embedded OpenCloud identity provider
+          (\`services/idp\`), built from upstream tag \`v${VERSION}\`.
+
+          - Upstream: https://github.com/${UPSTREAM}/tree/v${VERSION} (\`${upstream_sha}\`)
+          - Built with Node ${node_ver} and pnpm ${pnpm_ver} (\`pnpm install --frozen-lockfile && pnpm build\`)
+          - SHA256: \`${sha}\`
+
+          Used by the FreeBSD port www/opencloud. Extract into \`services/idp\`.
+          EOF
+          gh release create "$TAG" "dist/$ASSET" "dist/$ASSET.sha256" \
+            --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
